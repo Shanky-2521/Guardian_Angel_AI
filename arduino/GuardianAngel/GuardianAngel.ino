@@ -4,9 +4,9 @@
 
 // ===== User Config =====
 const char* WIFI_SSID = "Nani?";      // TODO: set (2.4 GHz WPA2 recommended)
-const char* WIFI_PASS = "qwertyuiop";          // TODO: set
-const char* SERVER_HOST = "10.65.219.95";      // Laptop Wi-Fi IPv4
-const uint16_t SERVER_PORT = 5001;
+const char* WIFI_PASS = "qwertyuiop";  // TODO: set
+const char* SERVER_HOST = "10.65.219.95";     // TODO: set to your laptop's IP
+const uint16_t SERVER_PORT = 5002;             // Guardian Angel AI backend port
 // =======================
 
 // Pins

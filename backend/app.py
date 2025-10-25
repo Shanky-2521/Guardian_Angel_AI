@@ -33,6 +33,10 @@ checkin_taps = {}
 checkin_lock = threading.Lock()
 CHECKIN_WINDOW_SECONDS = 5  # Must tap 3 times within 5 seconds
 
+# IFTTT Webhook Configuration (for Alexa announcements)
+IFTTT_WEBHOOK_KEY = os.getenv('IFTTT_WEBHOOK_KEY', 'kouHpRJ7j7LW7l-ssgtTToG7d2Il0zPpjygqNRuDubW')
+IFTTT_EVENT_NAME = 'guardian_alert'
+
 # Claude client (optional - will work without API key)
 claude_client = None
 if os.getenv('ANTHROPIC_API_KEY'):
@@ -46,6 +50,44 @@ def broadcast_event(event_data):
                 q.put(event_data)
             except:
                 pass
+
+def trigger_alexa_announcement(alert_type="alert", message=""):
+    """
+    Trigger Alexa announcement via IFTTT webhook
+    Integrated with original Arduino-Alexa system
+    """
+    try:
+        url = f"https://maker.ifttt.com/trigger/{IFTTT_EVENT_NAME}/with/key/{IFTTT_WEBHOOK_KEY}"
+        payload = {
+            "value1": "Guardian Angel Alert" if alert_type == "alert" else "Guardian Angel Check-in",
+            "value2": datetime.now().isoformat() + 'Z',
+            "value3": message or "Emergency assistance needed"
+        }
+        
+        print(f"🔊 Triggering Alexa announcement: {alert_type}")
+        response = http_requests.post(url, json=payload, timeout=10)
+        
+        if response.status_code == 200:
+            print(f"✅ Alexa announcement sent successfully")
+            return {
+                'success': True,
+                'status': 'sent',
+                'message': 'Alexa announcement triggered'
+            }
+        else:
+            print(f"⚠️  Alexa announcement failed: {response.status_code}")
+            return {
+                'success': False,
+                'status': 'failed',
+                'message': f'IFTTT returned {response.status_code}'
+            }
+    except Exception as e:
+        print(f"❌ Alexa announcement error: {e}")
+        return {
+            'success': False,
+            'status': 'error',
+            'message': str(e)
+        }
 
 def trigger_omi_recording(event_id, description):
     """
@@ -157,8 +199,10 @@ def checkin():
     alert_resolved = False
     if tap_count >= 3 and active_alert:
         with omi_recording_lock:
-            omi_recording_sessions[active_alert]['active'] = False
-            omi_recording_sessions[active_alert]['ended_at'] = timestamp_iso
+            if active_alert in omi_recording_sessions:
+                omi_recording_sessions[active_alert]['active'] = False
+                omi_recording_sessions[active_alert]['ended_at'] = timestamp_iso
+                print(f"🔒 OMI session {active_alert} deactivated - privacy protection enabled")
         alert_resolved = True
         print(f"🎉 TRIPLE TAP DETECTED! Alert {active_alert} auto-resolved")
         
@@ -246,21 +290,34 @@ def alert():
     # Trigger OMI recording (legacy support)
     omi_response = trigger_omi_recording(event_id, description)
     
-    # Broadcast to SSE clients
+    # Broadcast to SSE clients FIRST (for instant dashboard update)
     event_data = {
         "type": "alert",
         "timestamp": timestamp,
         "message": description,
         "id": event_id,
         "omi_activated": True,
-        "omi_session": event_id
+        "omi_session": event_id,
+        "alexa_announced": True  # Will be triggered async
     }
     broadcast_event(event_data)
     
     print(f"[{timestamp}] ALERT received: {description}")
     print(f"[{timestamp}] OMI recording: {omi_response.get('status', 'failed')}")
-    print(f"💡 Prompt user to activate OMI recording")
-    return jsonify({"status": "success", "event": event_data, "omi": omi_response}), 200
+    
+    # Trigger Alexa announcement in background (non-blocking)
+    def trigger_alexa_async():
+        alexa_response = trigger_alexa_announcement(alert_type="alert", message=description)
+        print(f"[{timestamp}] Alexa announcement: {alexa_response.get('status', 'failed')}")
+    
+    threading.Thread(target=trigger_alexa_async, daemon=True).start()
+    
+    return jsonify({
+        "status": "success",
+        "event": event_data,
+        "omi": omi_response,
+        "alexa": {"status": "sending", "message": "Triggered in background"}
+    }), 200
 
 @app.route('/api/events', methods=['GET'])
 def get_events():
@@ -374,7 +431,11 @@ def event_stream():
             with event_queues_lock:
                 event_queues.remove(q)
     
-    return Response(generate(), mimetype='text/event-stream')
+    # Prevent buffering for instant event delivery
+    response = Response(generate(), mimetype='text/event-stream')
+    response.headers['Cache-Control'] = 'no-cache'
+    response.headers['X-Accel-Buffering'] = 'no'
+    return response
 
 @app.route('/api/status', methods=['GET'])
 def status():
@@ -416,7 +477,8 @@ def omi_webhook():
         
         # If NO active alert, silently ignore and return success
         if not active_session:
-            return jsonify({"status": "ok"}), 200
+            print(f"🔒 OMI webhook received but NO ACTIVE alert - transcript BLOCKED (privacy protection)")
+            return jsonify({"status": "ok", "message": "No active alert - privacy protected"}), 200
         
         # Only if there's an ACTIVE ALERT, then process the transcript
         print(f"\n{'='*50}")

@@ -13,10 +13,17 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [activeStep, setActiveStep] = useState(0)
 
-  // Fetch initial events and status
+  // Fetch initial events and status, then poll every 5 seconds as fallback
   useEffect(() => {
     fetchEvents()
     fetchSystemStatus()
+    
+    // Polling fallback every 5 seconds (in case SSE fails)
+    const pollInterval = setInterval(() => {
+      fetchEvents()
+    }, 5000)
+    
+    return () => clearInterval(pollInterval)
   }, [])
 
   // Animate system flow when event occurs
@@ -30,47 +37,71 @@ function App() {
     setTimeout(() => setActiveStep(0), 1500) // Reset
   }
 
-  // Set up SSE connection for real-time updates
+  // Set up SSE connection for real-time updates with auto-reconnect
   useEffect(() => {
-    const eventSource = new EventSource(`${API_BASE_URL}/api/events/stream`)
+    let eventSource = null
+    let reconnectTimeout = null
     
-    eventSource.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data)
-        console.log('SSE received:', data)
-        setLastEvent(data)
-        setEvents(prev => [data, ...prev].slice(0, 20))
-        
-        // Animate system flow
-        animateFlow()
-        
-        // Update status based on event type
-        if (data.type === 'alert') {
-          setStatus('alert')
-          setTimeout(() => setStatus('idle'), 5000)
-        } else if (data.type === 'checkin') {
-          setStatus('safe')
-          setTimeout(() => setStatus('idle'), 3000)
-        } else if (data.type === 'omi_transcript') {
-          if (data.distress_detected) {
+    const connectSSE = () => {
+      console.log('🔌 Connecting to SSE stream...')
+      eventSource = new EventSource(`${API_BASE_URL}/api/events/stream`)
+      
+      eventSource.onopen = () => {
+        console.log('✅ SSE connected')
+      }
+      
+      eventSource.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data)
+          console.log('📡 SSE received:', data)
+          setLastEvent(data)
+          setEvents(prev => [data, ...prev].slice(0, 20))
+          
+          // Update status based on event type
+          if (data.type === 'alert') {
+            // Animate system flow for Arduino ALERTS
+            animateFlow()
             setStatus('alert')
             setTimeout(() => setStatus('idle'), 5000)
-          } else {
+          } else if (data.type === 'checkin') {
+            // Animate system flow for Arduino CHECK-INS too
+            animateFlow()
             setStatus('safe')
-            setTimeout(() => setStatus('idle'), 2000)
+            setTimeout(() => setStatus('idle'), 3000)
+          } else if (data.type === 'omi_transcript') {
+            // OMI transcripts don't trigger system flow animation (not from Arduino)
+            // Only update status if distress is detected (don't show 'safe' during active alert)
+            if (data.distress_detected) {
+              setStatus('alert')
+              setTimeout(() => setStatus('idle'), 5000)
+            }
+            // Non-distress transcripts during alert don't change status
+          } else if (data.type === 'alert_resolved') {
+            // Alert resolved via triple-tap
+            setStatus('safe')
+            setTimeout(() => setStatus('idle'), 3000)
           }
+        } catch (err) {
+          console.error('SSE parse error:', err)
         }
-      } catch (err) {
-        console.error('SSE parse error:', err)
+      }
+
+      eventSource.onerror = (err) => {
+        console.error('❌ SSE error:', err)
+        eventSource.close()
+        
+        // Auto-reconnect after 3 seconds
+        console.log('🔄 SSE reconnecting in 3 seconds...')
+        reconnectTimeout = setTimeout(connectSSE, 3000)
       }
     }
+    
+    connectSSE()
 
-    eventSource.onerror = (err) => {
-      console.error('SSE error:', err)
-      eventSource.close()
+    return () => {
+      if (eventSource) eventSource.close()
+      if (reconnectTimeout) clearTimeout(reconnectTimeout)
     }
-
-    return () => eventSource.close()
   }, [])
 
   const fetchEvents = async () => {
