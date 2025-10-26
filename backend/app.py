@@ -33,6 +33,11 @@ checkin_taps = {}
 checkin_lock = threading.Lock()
 CHECKIN_WINDOW_SECONDS = 5  # Must tap 3 times within 5 seconds
 
+# 🐟 Fish Audio Queue System (sequential playback, no overlap)
+audio_playback_queue = queue.Queue()
+audio_queue_lock = threading.Lock()
+audio_playback_active = False
+
 # IFTTT Webhook Configuration (for Alexa announcements)
 IFTTT_WEBHOOK_KEY = os.getenv('IFTTT_WEBHOOK_KEY', 'kouHpRJ7j7LW7l-ssgtTToG7d2Il0zPpjygqNRuDubW')
 IFTTT_EVENT_NAME = 'guardian_alert'
@@ -41,6 +46,11 @@ IFTTT_EVENT_NAME = 'guardian_alert'
 claude_client = None
 if os.getenv('ANTHROPIC_API_KEY'):
     claude_client = Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
+
+# Fish Audio Configuration (for AI voice summaries)
+FISH_AUDIO_API_KEY = os.getenv('FISH_AUDIO_API_KEY', '')
+FISH_AUDIO_API_URL = "https://api.fish.audio/v1/tts"  # Update with actual endpoint
+FISH_AUDIO_ENABLED = bool(FISH_AUDIO_API_KEY)
 
 def broadcast_event(event_data):
     """Broadcast event to all connected SSE clients"""
@@ -160,6 +170,205 @@ def trigger_omi_recording(event_id, description):
             'status': 'error',
             'message': str(e)
         }
+
+def generate_smart_summary(transcripts):
+    """
+    Generate intelligent summary from OMI transcripts
+    Analyzes content, detects distress, creates context-aware message
+    """
+    if not transcripts:
+        return "Emergency alert activated. Awaiting more information."
+    
+    full_text = " ".join(transcripts)
+    
+    # Detect distress keywords
+    distress_keywords = ['help', 'emergency', 'danger', 'hurt', 'pain', 'scared', 
+                        'attack', 'afraid', 'bleeding', 'cant breathe', 'fall', 'fell']
+    
+    distress_count = sum(1 for keyword in distress_keywords 
+                        if keyword.lower() in full_text.lower())
+    
+    # Get timestamp
+    timestamp = datetime.utcnow().strftime("%I:%M %p")
+    
+    # Generate context-aware summary
+    if distress_count >= 3:
+        found_keywords = [kw for kw in distress_keywords if kw.lower() in full_text.lower()][:3]
+        return (
+            f"Critical emergency detected at {timestamp}. "
+            f"Multiple distress signals identified. "
+            f"User mentioned: {', '.join(found_keywords)}. "
+            f"Immediate response required."
+        )
+    elif distress_count >= 1:
+        return (
+            f"Emergency alert at {timestamp}. "
+            f"Distress detected in user's speech. "
+            f"Alert level: High. Please check on user immediately."
+        )
+    else:
+        # Extract key phrase (first 60 chars)
+        preview = full_text[:60] + "..." if len(full_text) > 60 else full_text
+        return (
+            f"Alert triggered at {timestamp}. "
+            f"User said: '{preview}'. "
+            f"Please verify user safety."
+        )
+
+def fish_audio_text_to_speech(summary_text):
+    """
+    Convert summary text to natural speech using Fish Audio TTS
+    Returns path to audio file or None if API key not configured
+    """
+    if not FISH_AUDIO_ENABLED:
+        print("🐟 Fish Audio: Demo mode (API key not configured)")
+        return None
+    
+    try:
+        headers = {
+            "Authorization": f"Bearer {FISH_AUDIO_API_KEY}",
+            "Content-Type": "application/json",
+            "model": "s1"  # Fish Audio S1 model (recommended)
+        }
+        
+        payload = {
+            "text": summary_text,
+            "format": "mp3",
+            "temperature": 0.9,
+            "top_p": 0.9,
+            "normalize": True,
+            "mp3_bitrate": 128,
+            "latency": "normal"
+        }
+        
+        print(f"🐟 Calling Fish Audio API...")
+        response = http_requests.post(
+            FISH_AUDIO_API_URL,
+            json=payload,
+            headers=headers,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            # Fish Audio returns binary audio data directly
+            audio_file = f"/tmp/fish_audio_{int(time.time())}.mp3"
+            with open(audio_file, 'wb') as f:
+                f.write(response.content)
+            print(f"✅ Fish Audio generated: {audio_file}")
+            return audio_file
+        else:
+            print(f"❌ Fish Audio API error: {response.status_code} - {response.text}")
+            return None
+            
+    except Exception as e:
+        print(f"❌ Fish Audio error: {e}")
+        return None
+
+def play_audio_locally(audio_file):
+    """
+    Play Fish Audio MP3 on this machine
+    Works on macOS, Linux, and Windows
+    """
+    if not audio_file:
+        return False
+    
+    try:
+        import platform
+        
+        # Play based on OS
+        system = platform.system()
+        
+        if system == "Darwin":  # macOS
+            os.system(f"afplay {audio_file} &")
+            print(f"🔊 Playing audio on macOS: {audio_file}")
+        elif system == "Linux":
+            os.system(f"mpg123 {audio_file} &")
+            print(f"🔊 Playing audio on Linux: {audio_file}")
+        elif system == "Windows":
+            os.system(f"start {audio_file}")
+            print(f"🔊 Playing audio on Windows: {audio_file}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Audio playback error: {e}")
+        return False
+
+def audio_queue_player():
+    """
+    Background thread that plays audio files sequentially from queue
+    Ensures no overlap - waits for each to finish before playing next
+    """
+    global audio_playback_active
+    
+    while True:
+        try:
+            # Get next audio file from queue (blocks until available)
+            audio_item = audio_playback_queue.get()
+            
+            if audio_item is None:  # Poison pill to stop thread
+                break
+            
+            audio_file = audio_item.get('file')
+            summary = audio_item.get('summary', '')
+            
+            print(f"\n{'='*60}")
+            print(f"🔊 PLAYING FROM QUEUE")
+            print(f"📝 Summary: {summary[:80]}...")
+            print(f"🎵 File: {audio_file}")
+            print(f"{'='*60}\n")
+            
+            # Play audio and WAIT for it to finish
+            if audio_file and os.path.exists(audio_file):
+                import platform
+                import subprocess
+                
+                system = platform.system()
+                
+                if system == "Darwin":  # macOS
+                    # afplay blocks until audio finishes
+                    subprocess.run(['afplay', audio_file], check=False)
+                elif system == "Linux":
+                    subprocess.run(['mpg123', audio_file], check=False)
+                elif system == "Windows":
+                    subprocess.run(['start', '/wait', audio_file], shell=True, check=False)
+                
+                print(f"✅ Finished playing: {audio_file}")
+            else:
+                print(f"⚠️  Audio file not found: {audio_file}")
+            
+            # Mark task as done
+            audio_playback_queue.task_done()
+            
+        except Exception as e:
+            print(f"❌ Queue player error: {e}")
+            audio_playback_queue.task_done()
+
+def add_to_audio_queue(audio_file, summary):
+    """
+    Add audio file to playback queue
+    Will play sequentially, no overlap
+    """
+    global audio_playback_active
+    
+    if audio_file:
+        audio_playback_queue.put({
+            'file': audio_file,
+            'summary': summary
+        })
+        print(f"📥 Added to queue (position: {audio_playback_queue.qsize()})")
+        
+        # Start queue player thread if not already running
+        with audio_queue_lock:
+            if not audio_playback_active:
+                audio_playback_active = True
+                player_thread = threading.Thread(
+                    target=audio_queue_player,
+                    daemon=True,
+                    name="AudioQueuePlayer"
+                )
+                player_thread.start()
+                print(f"🎬 Audio queue player started")
 
 @app.route('/api/checkin', methods=['POST'])
 def checkin():
@@ -456,6 +665,56 @@ def status():
             "error": str(e)
         }), 500
 
+@app.route('/api/fish-audio/summary', methods=['POST'])
+def generate_fish_audio_summary_endpoint():
+    """
+    🐟 Generate Fish Audio voice summary
+    POST with: {"transcripts": ["text1", "text2", ...]}
+    Or get summary for latest active alert
+    """
+    try:
+        data = request.get_json() or {}
+        transcripts = data.get('transcripts', [])
+        
+        # If no transcripts provided, get from latest active session
+        if not transcripts:
+            with omi_recording_lock:
+                for session_id, session_data in omi_recording_sessions.items():
+                    if session_data.get('active', False):
+                        transcripts = session_data.get('transcripts', [])
+                        break
+        
+        if not transcripts:
+            return jsonify({
+                "error": "No transcripts available",
+                "message": "Provide transcripts or have an active alert"
+            }), 400
+        
+        # Generate summary
+        summary = generate_smart_summary(transcripts)
+        
+        # Convert to speech
+        audio_url = fish_audio_text_to_speech(summary)
+        
+        # Play if requested
+        if data.get('play', False) and audio_url:
+            threading.Thread(
+                target=play_audio_locally,
+                args=(audio_url,),
+                daemon=True
+            ).start()
+        
+        return jsonify({
+            "summary": summary,
+            "audio_url": audio_url,
+            "transcript_count": len(transcripts),
+            "fish_audio_enabled": FISH_AUDIO_ENABLED,
+            "mode": "production" if FISH_AUDIO_ENABLED else "demo"
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/omi/webhook', methods=['POST'])
 def omi_webhook():
     """
@@ -585,6 +844,13 @@ def omi_webhook():
                     print(f"⚠️  DISTRESS DETECTED in OMI transcript: {transcript_text}")
                     # Could trigger additional alert here
                 
+                # Store transcript in session for Fish Audio processing
+                with omi_recording_lock:
+                    if active_session in omi_recording_sessions:
+                        if 'transcripts' not in omi_recording_sessions[active_session]:
+                            omi_recording_sessions[active_session]['transcripts'] = []
+                        omi_recording_sessions[active_session]['transcripts'].append(transcript_text)
+                
                 # Broadcast to SSE for dashboard (only if we have text)
                 broadcast_event({
                     "type": "omi_transcript",
@@ -597,6 +863,28 @@ def omi_webhook():
                 })
                 
                 print(f"[{timestamp}] OMI Transcript: {transcript_text[:50]}...")
+                
+                # 🐟 FISH AUDIO INTEGRATION - Process EACH transcript individually
+                print(f"\n{'='*60}")
+                print(f"🐟 FISH AUDIO: Processing NEW transcript")
+                print(f"{'='*60}")
+                
+                # 1. Generate smart summary from this single transcript
+                summary = generate_smart_summary([transcript_text])
+                print(f"📝 Summary: {summary}")
+                
+                # 2. Convert to speech with Fish Audio
+                audio_file = fish_audio_text_to_speech(summary)
+                
+                # 3. Add to queue (will play sequentially, no overlap)
+                if audio_file:
+                    add_to_audio_queue(audio_file, summary)
+                    print(f"✅ Added to playback queue")
+                else:
+                    # Demo mode - just print the summary
+                    print(f"🔊 DEMO MODE - Would say: '{summary}'")
+                
+                print(f"🐟 Fish Audio processing complete!\n")
             else:
                 print(f"Empty transcript text, skipping...")
         else:
